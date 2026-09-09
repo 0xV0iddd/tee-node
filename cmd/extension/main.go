@@ -14,7 +14,7 @@ import (
 func main() {
 	logger.Set(logger.Config{Console: true, Level: settings.LogLevel})
 
-	teeNode, err := node.Initialize(node.ZeroState{})
+	teeNode, err := node.Initialize(node.NewExtensionState(settings.ExtensionPort))
 	if err != nil {
 		logger.Fatalf("failed to initialize: %v", err)
 	}
