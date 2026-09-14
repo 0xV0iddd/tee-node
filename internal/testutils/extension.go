@@ -23,6 +23,10 @@ type DummyExtensionServer struct {
 	port    int
 	signURL string
 	version string
+
+	// state is served by the /state route.
+	state        []byte
+	stateVersion common.Hash
 }
 
 // NewDummyExtensionServer spins up a mock signing server that exercises the
@@ -71,13 +75,39 @@ func StartDummyExtensionServer(t *testing.T, signURL string) int {
 	return addr.Port
 }
 
-// registerRoutes registers the /action endpoint.
+// registerRoutes registers the /action and /state endpoints.
 func (d *DummyExtensionServer) registerRoutes() {
 	mux := http.NewServeMux()
 	d.server.Handler = mux
 
 	// Dummy action endpoint
 	mux.HandleFunc("POST /action", d.actionHandler)
+	mux.HandleFunc("GET /state", d.stateHandler)
+}
+
+// SetState sets the state the /state route reports.
+func (d *DummyExtensionServer) SetState(state []byte, version common.Hash) {
+	d.state = state
+	d.stateVersion = version
+}
+
+// stateHandler serves the extension half of the node state. Only State and
+// StateVersion are read by the node; the system half it sends is ignored.
+func (d *DummyExtensionServer) stateHandler(w http.ResponseWriter, _ *http.Request) {
+	res, err := json.Marshal(types.TeeState{
+		State:        hexutil.Bytes(d.state),
+		StateVersion: d.stateVersion,
+	})
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	if _, err := w.Write(res); err != nil {
+		logger.Errorf("dummy extension: writing state: %v", err)
+	}
 }
 
 // actionHandler handles /action requests.
